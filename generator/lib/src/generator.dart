@@ -5,6 +5,7 @@ import 'dart:typed_data' as typed_data;
 import 'package:analyzer/dart/constant/value.dart';
 import 'package:analyzer/dart/element/element.dart';
 import 'package:analyzer/dart/element/nullability_suffix.dart';
+import 'package:analyzer/dart/element/type.dart' as analyzer_type;
 import 'package:analyzer/dart/element/type.dart';
 // ignore: implementation_imports
 import 'package:analyzer/src/dart/element/type.dart';
@@ -14,12 +15,15 @@ import 'package:code_builder/code_builder.dart';
 import 'package:dart_style/dart_style.dart';
 import 'package:dio/dio.dart';
 import 'package:fpdart/fpdart.dart';
-import 'package:protobuf/protobuf.dart' as protobuf;
+import 'package:protobuf/protobuf.dart'
+    as protobuf
+    show GeneratedMessage, ProtobufEnum;
 import 'package:retrofit/retrofit.dart' as retrofit;
 import 'package:source_gen/source_gen.dart';
 
 const _analyzerIgnores =
-    '// ignore_for_file: unnecessary_brace_in_string_interps,no_leading_underscores_for_local_identifiers,unused_element,unnecessary_string_interpolations,unused_element_parameter,avoid_unused_constructor_parameters,unreachable_from_main';
+    '// ignore_for_file: type=lint\n'
+    '// ignore_for_file: unnecessary_brace_in_string_interps,no_leading_underscores_for_local_identifiers,unused_element,unnecessary_string_interpolations,unused_element_parameter,avoid_unused_constructor_parameters,unreachable_from_main,avoid_redundant_argument_values';
 
 /// Factory for the Retrofit code generator used by build_runner.
 Builder generatorFactoryBuilder(BuilderOptions options) {
@@ -28,7 +32,9 @@ Builder generatorFactoryBuilder(BuilderOptions options) {
     [RetrofitGenerator(retrofitOptions)],
     'retrofit',
     formatOutput: (code, version) {
-      final formattedCode = DartFormatter(languageVersion: version).format(code);
+      final formattedCode = DartFormatter(
+        languageVersion: version,
+      ).format(code);
       // Only add format suppressing comments if format_output is true (default)
       if (retrofitOptions.formatOutput ?? true) {
         return '// dart format off\n\n$formattedCode\n// dart format on\n';
@@ -460,7 +466,7 @@ class RetrofitGenerator extends GeneratorForAnnotation<retrofit.RestApi> {
           ? '<${element.typeParameters.join(',')}>'
           : '');
 
-  final _methodsAnnotations = const {
+  final Set<Type> _methodsAnnotations = const {
     retrofit.GET,
     retrofit.POST,
     retrofit.DELETE,
@@ -935,13 +941,14 @@ class RetrofitGenerator extends GeneratorForAnnotation<retrofit.RestApi> {
 
     extraOptions[_baseUrlVar] = refer(_baseUrlVar);
 
-    final responseType = _getResponseTypeAnnotation(m);
-    if (responseType != null) {
-      final v = responseType.peek('responseType')?.objectValue;
+    final responseTypeAnnotation = _getResponseTypeAnnotation(m);
+    ResponseType? parsedResponseType;
+    if (responseTypeAnnotation != null) {
+      final v = responseTypeAnnotation.peek('responseType')?.objectValue;
       log.info('ResponseType  :  ${v?.getField('index')?.toIntValue()}');
       final rsType = ResponseType.values.firstWhere(
         (it) =>
-            responseType
+            responseTypeAnnotation
                 .peek('responseType')
                 ?.objectValue
                 .getField('index')
@@ -953,7 +960,21 @@ class RetrofitGenerator extends GeneratorForAnnotation<retrofit.RestApi> {
         },
       );
 
+      parsedResponseType = rsType;
       extraOptions['responseType'] = refer(rsType.toString());
+
+      // Validate that ResponseType.stream requires Stream<Uint8List> or Stream<String> return type
+      if (rsType == ResponseType.stream) {
+        if (!_isValidStreamResponseType(m.returnType)) {
+          throw InvalidGenerationSourceError(
+            'When using @DioResponseType(ResponseType.stream), the return type must be Stream<Uint8List> or Stream<String>. '
+            'Got: ${_displayString(m.returnType)}',
+            element: m,
+            todo:
+                'Change the return type to Stream<Uint8List> or Stream<String> when using ResponseType.stream',
+          );
+        }
+      }
     }
     final namedArguments = <String, Expression>{};
     namedArguments[_queryParamsVar] = refer(_queryParamsVar);
@@ -983,7 +1004,7 @@ class RetrofitGenerator extends GeneratorForAnnotation<retrofit.RestApi> {
           .statement,
     );
 
-    final options = refer(_optionsVar).expression;
+    final options = refer(_optionsVar);
 
     final wrappedReturnType = _getResponseType(
       callAdapter != null
@@ -1003,7 +1024,7 @@ class RetrofitGenerator extends GeneratorForAnnotation<retrofit.RestApi> {
         : isEither
             ? _getLastTypeOf(wrappedReturnType)
             : isRecords
-                ? _getRecordsFirstTypeOf(wrappedReturnType!)
+                ? _getRecordsFirstTypeOf(wrappedReturnType)
                 : wrappedReturnType;
     
     // Wrap entire response handling in try-catch for Either/Records support
@@ -1030,6 +1051,43 @@ $returnAsyncWrapper httpResponse;
           refer(
             'await $_dioVar.fetch',
           ).call([options], {}, [refer('void')]).statement,
+        );
+      }
+    } else if (parsedResponseType == ResponseType.stream &&
+        _isValidStreamResponseType(m.returnType)) {
+      // Handle Stream<Uint8List> or Stream<String> return type with ResponseType.stream
+      // Dio returns ResponseBody when ResponseType.stream is used,
+      // we extract the stream from it
+      blocks.add(
+        declareFinal(_resultVar)
+            .assign(refer('$_dioVar.fetch<ResponseBody>').call([options]))
+            .statement,
+      );
+
+      if (_isStreamOfString(m.returnType)) {
+        // For Stream<String>, decode the bytes to strings using utf8.decoder.bind
+        // Note: Requires 'import dart:convert;' in the main API file (not in .g file as it's a part)
+        log.warning(
+          '\u001b[33mMethod ${m.displayName} returns Stream<String> and uses utf8.decoder.bind. '
+          "Ensure your API class file imports dart:convert: import 'dart:convert';\u001b[0m",
+        );
+        blocks.add(
+          Code('''
+final $_valueVar = $_resultVar.asStream().asyncExpand(
+  (response) => utf8.decoder.bind(response.data!.stream),
+);
+$returnAsyncWrapper* $_valueVar;
+'''),
+        );
+      } else {
+        // For Stream<Uint8List>, return the raw stream
+        blocks.add(
+          Code('''
+final $_valueVar = $_resultVar.asStream().asyncExpand(
+  (response) => response.data!.stream,
+);
+$returnAsyncWrapper* $_valueVar;
+'''),
         );
       }
     } else {
@@ -1451,7 +1509,7 @@ You should create a new class to encapsulate the response.
             )
             ..add(
               Code(
-                'final $_valueVar = await compute(${_displayString(returnType)}.fromBuffer, $_resultVar.data!);',
+                'final $_valueVar = ${_displayString(returnType)}.fromBuffer($_resultVar.data!);',
               ),
             );
         } else {
@@ -1717,7 +1775,9 @@ $returnAsyncWrapper httpResponse;
         return mappedVal;
       }
     } else {
-      if (_displayString(dartType) == 'dynamic' || _isBasicType(dartType)) {
+      if (_displayString(dartType) == 'dynamic' ||
+          _isBasicType(dartType) ||
+          dartType is TypeParameterType) {
         return '(json) => json as ${_displayString(dartType, withNullability: dartType.isNullable)},';
       } else {
         if (_displayString(dartType) == 'void') {
@@ -1920,7 +1980,7 @@ if (options is Options) {
     extra: options.extra,
     headers: options.headers,
     responseType: options.responseType,
-    contentType: options.contentType.toString(),
+    contentType: options.contentType?.toString(),
     validateStatus: options.validateStatus,
     receiveDataWhenStatusError: options.receiveDataWhenStatusError,
     followRedirects: options.followRedirects,
@@ -2049,6 +2109,30 @@ if (T != dynamic &&
   /// Checks if the type is Uint8List.
   bool _isUint8List(DartType? t) => _isExactly(typed_data.Uint8List, t);
 
+  /// Checks if the type is `Stream<Uint8List>`.
+  bool _isStreamOfUint8List(DartType? t) {
+    if (t == null || !_isExactly(Stream, t)) {
+      return false;
+    }
+    final innerType = _genericOf(t);
+    return _isUint8List(innerType);
+  }
+
+  /// Checks if the type is `Stream<String>`.
+  bool _isStreamOfString(DartType? t) {
+    if (t == null || !_isExactly(Stream, t)) {
+      return false;
+    }
+    final innerType = _genericOf(t);
+    return _isExactly(String, innerType);
+  }
+
+  /// Checks if the type is a valid stream type for ResponseType.stream.
+  /// Valid types are `Stream<Uint8List>` or `Stream<String>`.
+  bool _isValidStreamResponseType(DartType? t) {
+    return _isStreamOfUint8List(t) || _isStreamOfString(t);
+  }
+
   /// Checks if the type is DateTime.
   bool _isDateTime(DartType? t) => _isExactly(DateTime, t);
 
@@ -2090,29 +2174,55 @@ if (T != dynamic &&
     if (dartType is! InterfaceType) {
       return false;
     }
-    // Use lookUpMethod to check the class hierarchy including mixins
-    // This is important for Freezed-generated classes where toJson is in a mixin
-    return dartType.element.lookUpMethod(
-          name: 'toJson',
-          library: dartType.element.library,
-        ) !=
-        null;
+    return _declaresToJson(dartType.element);
+  }
+
+  /// True when [element] has `toJson`, including mixin / abstract / generated
+  /// methods. A source `fromJson` factory is enough: json_serializable and
+  /// Freezed generate `toJson` in parts that build_runner may hide from us.
+  bool _declaresToJson(InterfaceElement element) {
+    if (element.lookUpMethod(name: 'toJson', library: element.library) !=
+        null) {
+      return true;
+    }
+    if (element.getMethod('toJson') != null) {
+      return true;
+    }
+    if (element is ClassElement) {
+      if (element.getNamedConstructor('fromJson') != null) {
+        return true;
+      }
+      for (final constructor in element.constructors) {
+        final redirected =
+            constructor.redirectedConstructor?.returnType.element;
+        if (redirected is InterfaceElement &&
+            (redirected.getMethod('toJson') != null ||
+                redirected.lookUpMethod(
+                      name: 'toJson',
+                      library: redirected.library,
+                    ) !=
+                    null)) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   /// Gets the expression for serializing an enum value in FormData as a string.
-  /// Uses toJson() if available, otherwise uses .name.
+  /// Uses toJson() if available, otherwise uses toString().
   String _getEnumValueExpression(DartType enumType, String variableName) {
     return _hasToJson(enumType)
         ? '$variableName.toJson()'
-        : '$variableName.name';
+        : '$variableName.toString()';
   }
 
   /// Gets the Reference for serializing an enum value in FormData.
-  /// Uses toJson() if available, otherwise uses .name.
+  /// Uses toJson() if available, otherwise uses toString().
   Expression _getEnumValueReference(DartType enumType, String variableName) {
     return _hasToJson(enumType)
         ? refer(variableName).property('toJson').call([])
-        : refer(variableName).property('name');
+        : refer(variableName).property('toString').call([]);
   }
 
   /// Generates the query parameters code block.
@@ -2507,18 +2617,53 @@ if (T != dynamic &&
               ).assign(refer(bodyName.displayName)).statement,
             );
           } else if (_missingSerialize(
-            ele.enclosingElement.firstFragment,
-            bodyName.type,
-          )) {
-            log.warning(
-              '${_displayString(bodyName.type)} must provide a `serialize${_displayString(bodyName.type)}()` method which returns a Map.\n'
-              "It is programmer's responsibility to make sure the ${_displayString(bodyName.type)} is properly serialized",
-            );
-            blocks.add(
-              declareFinal(
-                dataVar,
-              ).assign(refer(bodyName.displayName)).statement,
-            );
+                ele.enclosingElement.firstFragment,
+                bodyName.type,
+              ) &&
+              _missingSerialize(m.library.firstFragment, bodyName.type)) {
+            if (_declaresToJson(ele)) {
+              final nullable =
+                  bodyName.type.nullabilitySuffix == NullabilitySuffix.question;
+              final toJsonExpr = nullable
+                  ? '${bodyName.displayName}?.toJson() ?? <String, dynamic>{}'
+                  : '${bodyName.displayName}.toJson()';
+              if (bodyExtras.isEmpty && expandBodyExtras.isEmpty) {
+                blocks.add(
+                  declareFinal(dataVar).assign(refer(toJsonExpr)).statement,
+                );
+              } else {
+                blocks.add(
+                  declareFinal(dataVar)
+                      .assign(
+                        literalMap(
+                          bodyExtras,
+                          refer('String'),
+                          refer('dynamic'),
+                        ),
+                      )
+                      .statement,
+                );
+                for (final item in expandBodyExtras.entries) {
+                  _generateParameterElement(item.key, blocks, dataVar);
+                }
+                blocks.add(
+                  refer('$dataVar.addAll').call([refer(toJsonExpr)]).statement,
+                );
+              }
+              if (preventNullToAbsent == null && nullToAbsent) {
+                blocks.add(Code('$dataVar.removeWhere((k, v) => v == null);'));
+              }
+            } else {
+              log.warning(
+                '${_displayString(bodyName.type)} must provide a `serialize${_displayString(bodyName.type)}()` method which returns a Map.\n'
+                "It is programmer's responsibility to make sure the ${_displayString(bodyName.type)} is properly serialized",
+              );
+              blocks.add(
+                declareFinal(
+                  dataVar,
+                ).assign(refer(bodyName.displayName)).statement,
+              );
+            }
           } else {
             blocks.add(
               declareFinal(dataVar)
@@ -2608,6 +2753,34 @@ if (T != dynamic &&
               blocks.add(Code('$dataVar.removeWhere((k, v) => v == null);'));
             }
           }
+        }
+      } else if (bodyName.type is analyzer_type.RecordType) {
+        switch (clientAnnotation.parser) {
+          case retrofit.Parser.DartMappable:
+            if (bodyName.type.nullabilitySuffix != NullabilitySuffix.question) {
+              blocks.add(
+                declareFinal(
+                  dataVar,
+                ).assign(refer('${bodyName.displayName}.toMap()')).statement,
+              );
+            } else {
+              blocks.add(
+                declareFinal(dataVar)
+                    .assign(
+                      refer(
+                        '${bodyName.displayName}?.toMap() ?? <String, dynamic>{}',
+                      ),
+                    )
+                    .statement,
+              );
+            }
+          case retrofit.Parser.JsonSerializable:
+          case retrofit.Parser.DartJsonMapper:
+          case retrofit.Parser.MapSerializable:
+          case retrofit.Parser.FlutterCompute:
+            throw UnsupportedError(
+              'Record types are not supported with the selected parser: ${clientAnnotation.parser}.',
+            );
         }
       } else {
         /// @Body annotations with no type are assigned as is
@@ -2774,6 +2947,22 @@ if (T != dynamic &&
             final fileNameVar = '_${fieldName}_fileName';
             final contentTypeVar = '_${fieldName}_contentType';
 
+            final optionalFile =
+                m.formalParameters
+                    .firstWhereOrNull((pp) => pp.displayName == p.displayName)
+                    ?.isOptional ??
+                false;
+
+            // The helper variables below read the part parameter, so for a
+            // nullable part they must be declared inside the null check.
+            final needsNullCheck = p.type.isNullable || optionalFile;
+            if (needsNullCheck) {
+              final condition = refer(
+                p.displayName,
+              ).notEqualTo(literalNull).code;
+              blocks.addAll([const Code('if('), condition, const Code(') {')]);
+            }
+
             // Generate code to extract runtime fileName
             if (fileNameValue != null) {
               blocks.add(
@@ -2813,35 +3002,16 @@ if (T != dynamic &&
               },
             );
 
-            final optionalFile =
-                m.formalParameters
-                    .firstWhereOrNull((pp) => pp.displayName == p.displayName)
-                    ?.isOptional ??
-                false;
+            blocks.add(
+              refer(dataVar).property('files').property('add').call([
+                refer(
+                  'MapEntry',
+                ).newInstance([literal(fieldName), uploadFileInfo]),
+              ]).statement,
+            );
 
-            final returnCode = refer(dataVar)
-                .property('files')
-                .property('add')
-                .call([
-                  refer(
-                    'MapEntry',
-                  ).newInstance([literal(fieldName), uploadFileInfo]),
-                ])
-                .statement;
-
-            if (p.type.isNullable || optionalFile) {
-              final condition = refer(
-                p.displayName,
-              ).notEqualTo(literalNull).code;
-              blocks.addAll([
-                const Code('if('),
-                condition,
-                const Code(') {'),
-                returnCode,
-                const Code('}'),
-              ]);
-            } else {
-              blocks.add(returnCode);
+            if (needsNullCheck) {
+              blocks.add(const Code('}'));
             }
           } else {
             // No PartMap - use original static approach
@@ -3245,15 +3415,20 @@ MultipartFile.fromFileSync(i.path,
           final ele = p.type.element! as ClassElement;
           if (_missingToJson(ele)) {
             if (_isDateTime(p.type)) {
-              final expr = [
-                if (p.type.nullabilitySuffix == NullabilitySuffix.question)
-                  refer(
-                    p.displayName,
-                  ).nullSafeProperty('toIso8601String').call([])
-                else
-                  refer(p.displayName).property('toIso8601String').call([]),
-              ];
-              refer(dataVar).property('fields').property('add').call(expr);
+              if (p.type.nullabilitySuffix == NullabilitySuffix.question) {
+                blocks.add(Code('if (${p.displayName} != null) {'));
+              }
+              blocks.add(
+                refer(dataVar).property('fields').property('add').call([
+                  refer('MapEntry').newInstance([
+                    literal(fieldName),
+                    refer(p.displayName).property('toIso8601String').call([]),
+                  ]),
+                ]).statement,
+              );
+              if (p.type.nullabilitySuffix == NullabilitySuffix.question) {
+                blocks.add(const Code('}'));
+              }
             } else {
               throw Exception('toJson() method have to add to ${p.type}');
             }
@@ -3746,10 +3921,7 @@ MultipartFile.fromFileSync(i.path,
     switch (clientAnnotation.parser) {
       case retrofit.Parser.JsonSerializable:
       case retrofit.Parser.DartJsonMapper:
-        // Use lookUpMethod to check the class hierarchy including mixins
-        // This is important for Freezed-generated classes where toJson is in a mixin
-        final toJson = ele.lookUpMethod(name: 'toJson', library: ele.library);
-        return toJson == null;
+        return !_declaresToJson(ele);
       case retrofit.Parser.MapSerializable:
       case retrofit.Parser.DartMappable:
       case retrofit.Parser.FlutterCompute:
@@ -3921,6 +4093,16 @@ String revivedLiteral(Object object, {DartEmitter? dartEmitter}) {
 }
 
 String _displayString(DartType? e, {bool withNullability = false}) {
+  if (e is analyzer_type.RecordType) {
+    final name = e.alias?.element.name;
+    if (name != null) {
+      if (withNullability && e.isNullable) {
+        return '$name?';
+      } else {
+        return name;
+      }
+    }
+  }
   try {
     if (!withNullability) {
       return e!.toStringNonNullable();

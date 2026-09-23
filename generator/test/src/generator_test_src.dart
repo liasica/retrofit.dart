@@ -1,10 +1,12 @@
 import 'dart:io';
 
+import 'dart:typed_data';
+
 import 'package:dio/dio.dart' hide Headers;
 import 'package:retrofit/retrofit.dart';
 import 'package:source_gen_test/annotations.dart';
 
-import 'query.pb.dart';
+import 'result.pb.dart';
 
 class Resource<T> {}
 
@@ -210,7 +212,8 @@ abstract class MultipleTypedExtrasTest {
 }
 
 @ShouldGenerate('''
-// ignore_for_file: unnecessary_brace_in_string_interps,no_leading_underscores_for_local_identifiers,unused_element,unnecessary_string_interpolations,unused_element_parameter,avoid_unused_constructor_parameters,unreachable_from_main
+// ignore_for_file: type=lint
+// ignore_for_file: unnecessary_brace_in_string_interps,no_leading_underscores_for_local_identifiers,unused_element,unnecessary_string_interpolations,unused_element_parameter,avoid_unused_constructor_parameters,unreachable_from_main,avoid_redundant_argument_values
 
 class _RestClient implements RestClient {
   _RestClient(this._dio, {this.baseUrl, this.errorLogger});
@@ -1090,17 +1093,41 @@ abstract class TestQueryParamExtensionTypeWithToJsonNullable {
 
 @ShouldGenerate(
   '''
-    final _data = customObject;
+  Stream<Uint8List> downloadFile() async* {
+    final _extra = <String, dynamic>{};
+    final queryParameters = <String, dynamic>{};
+    final _headers = <String, dynamic>{};
+    const Map<String, dynamic>? _data = null;
+    final _options = _setStreamType<Uint8List>(
+      Options(
+            method: 'GET',
+            headers: _headers,
+            extra: _extra,
+            responseType: ResponseType.stream,
+          )
+          .compose(
+            _dio.options,
+            '/download',
+            queryParameters: queryParameters,
+            data: _data,
+          )
+          .copyWith(baseUrl: _combineBaseUrls(_dio.options.baseUrl, baseUrl)),
+    );
+    final _result = _dio.fetch<ResponseBody>(_options);
+    final _value = _result.asStream().asyncExpand(
+      (response) => response.data!.stream,
+    );
+    yield* _value;
+  }
 ''',
   contains: true,
-  expectedLogItems: [
-    "CustomObject must provide a `toJson()` method which return a Map.\nIt is programmer's responsibility to make sure the CustomObject is properly serialized",
-  ],
+  expectedLogItems: ['ResponseType  :  1'],
 )
-@RestApi(baseUrl: 'https://httpbin.org/')
-abstract class TestCustomObjectBody {
-  @POST('/custom-object')
-  Future<String> createCustomObject(@Body() CustomObject customObject);
+@RestApi()
+abstract class TestResponseTypeStream {
+  @GET('/download')
+  @DioResponseType(ResponseType.stream)
+  Stream<Uint8List> downloadFile();
 }
 
 @ShouldGenerate('''
@@ -1241,6 +1268,31 @@ abstract class TestMapBodyWithGenericList {
 abstract class TestMapBodyWithGeneric {
   @GET('/xx')
   Future<Map<String, GenericUser<User>>> getResult();
+}
+
+@ShouldGenerate('''
+    late Map<String, GenericUser<T>> _value;
+    try {
+      _value = _result.data!.map(
+        (k, dynamic v) => MapEntry(
+          k,
+          GenericUser<T>.fromJson(
+            v as Map<String, dynamic>,
+            (json) => json as T,
+          ),
+        ),
+      );
+    } on Object catch (e, s) {
+      errorLogger?.logError(e, s, _options, response: _result);
+      rethrow;
+    }
+    return _value;
+  }
+''', contains: true)
+@RestApi(baseUrl: 'https://httpbin.org/')
+abstract class TestMapBodyWithGenericTypeParameter<T> {
+  @GET('/xx')
+  Future<Map<String, GenericUser<T>>> getResult();
 }
 
 @ShouldGenerate('''
@@ -1420,6 +1472,24 @@ abstract class TestOptionsMethod {
 }
 
 @ShouldGenerate('''
+      Options(method: 'QUERY', headers: _headers, extra: _extra)
+''', contains: true)
+@RestApi(baseUrl: 'https://httpbin.org/')
+abstract class TestQueryMethod {
+  @QUERY('/')
+  Future<String> testQueryMethod();
+}
+
+@ShouldGenerate('''
+      Options(method: 'QUERY', headers: _headers, extra: _extra)
+''', contains: true)
+@RestApi(baseUrl: 'https://httpbin.org/')
+abstract class TestQueryMethodWithBody {
+  @QUERY('/search')
+  Future<String> testQueryMethodWithBody(@Body() Map<String, dynamic> query);
+}
+
+@ShouldGenerate('''
     final httpResponse = HttpResponse(null, _result);
 ''', contains: true)
 @RestApi()
@@ -1559,14 +1629,14 @@ enum TestEnumWithToJson {
     final _data = FormData.fromMap(map);
 ''', contains: true)
 @ShouldGenerate('''
-_data.fields.add(MapEntry('enumValue', enumValue.name));
+_data.fields.add(MapEntry('enumValue', enumValue.toString()));
 ''', contains: true)
 @ShouldGenerate('''
     _data.fields.add(MapEntry('enumValue', enumValue.toJson()));
 ''', contains: true)
 @ShouldGenerate('''
     enumValues.forEach((i) {
-      _data.fields.add(MapEntry('enumValues', i.name));
+      _data.fields.add(MapEntry('enumValues', i.toString()));
     });
 ''', contains: true)
 @ShouldGenerate('''
@@ -1645,7 +1715,7 @@ abstract class TestModelList {
         extra: options.extra,
         headers: options.headers,
         responseType: options.responseType,
-        contentType: options.contentType.toString(),
+        contentType: options.contentType?.toString(),
         validateStatus: options.validateStatus,
         receiveDataWhenStatusError: options.receiveDataWhenStatusError,
         followRedirects: options.followRedirects,
@@ -1789,6 +1859,59 @@ abstract class JsonMapperTestMapBody2 {
 abstract class MapSerializableGenericCast {
   @POST('/xx')
   Future<User> getUser();
+}
+
+typedef UserRecord = ();
+
+@ShouldGenerate(
+  '      _value = UserRecordMapper.fromMap(_result.data!);',
+  contains: true,
+)
+@RestApi(baseUrl: 'https://httpbin.org/', parser: Parser.DartMappable)
+abstract class DartMappableRecordReturnType {
+  @GET('/xx')
+  Future<UserRecord> getResult();
+}
+
+@ShouldGenerate(
+  '    late UserRecord? _value;',
+  contains: true,
+)
+@RestApi(baseUrl: 'https://httpbin.org/', parser: Parser.DartMappable)
+abstract class DartMappableNullableRecordReturnType {
+  @GET('/xx')
+  Future<UserRecord?> getResult();
+}
+
+@ShouldGenerate('''
+      _value = _result.data!
+          .map(
+            (dynamic i) => UserRecordMapper.fromMap(i as Map<String, dynamic>),
+          )
+          .toList();
+''', contains: true)
+@RestApi(baseUrl: 'https://httpbin.org/', parser: Parser.DartMappable)
+abstract class DartMappableRecordListReturnType {
+  @GET('/xx')
+  Future<List<UserRecord>> getResult();
+}
+
+@ShouldGenerate('''
+    final _data = body.toMap();
+''', contains: true)
+@RestApi(baseUrl: 'https://httpbin.org/', parser: Parser.DartMappable)
+abstract class DartMappableRecordBody {
+  @POST('/xx')
+  Future<void> postResult(@Body() UserRecord body);
+}
+
+@ShouldGenerate('''
+    final _data = body?.toMap() ?? <String, dynamic>{};
+''', contains: true)
+@RestApi(baseUrl: 'https://httpbin.org/', parser: Parser.DartMappable)
+abstract class DartMappableNullableRecordBody {
+  @POST('/xx')
+  Future<void> postResult(@Body() UserRecord? body);
 }
 
 @ShouldGenerate('''
@@ -2212,6 +2335,21 @@ abstract class ComputeQueries {
 abstract class TestComputeObjectBody {
   @GET('/xx')
   Future<void> getResult(@Body() User user);
+}
+
+class SmsCodeRequest {
+  const SmsCodeRequest();
+
+  Map<String, dynamic> toJson() => <String, dynamic>{};
+}
+
+@ShouldGenerate('''
+    final _data = smsCodeRequest.toJson();
+''', contains: true)
+@RestApi(baseUrl: 'https://httpbin.org/', parser: Parser.FlutterCompute)
+abstract class TestComputeObjectBodyWithoutSerializeFn {
+  @POST('/user/sendCode')
+  Future<void> sendSmsCode(@Body() SmsCodeRequest smsCodeRequest);
 }
 
 @ShouldGenerate('''
@@ -2673,7 +2811,7 @@ abstract class CombineBaseUrls {
           .copyWith(baseUrl: _combineBaseUrls(_dio.options.baseUrl, baseUrl)),
     );
     final _result = await _dio.fetch<List<int>>(_options);
-    final _value = await compute(Result.fromBuffer, _result.data!);
+    final _value = Result.fromBuffer(_result.data!);
 ''', contains: true)
 @RestApi()
 abstract class ProtoSupportParserJsonSerializable {
@@ -2705,7 +2843,7 @@ abstract class ProtoSupportParserJsonSerializable {
           .copyWith(baseUrl: _combineBaseUrls(_dio.options.baseUrl, baseUrl)),
     );
     final _result = await _dio.fetch<List<int>>(_options);
-    final _value = await compute(Result.fromBuffer, _result.data!);
+    final _value = Result.fromBuffer(_result.data!);
 ''', contains: true)
 @RestApi(parser: Parser.DartJsonMapper)
 abstract class ProtoSupportParserDartJsonMapper {
@@ -2737,7 +2875,7 @@ abstract class ProtoSupportParserDartJsonMapper {
           .copyWith(baseUrl: _combineBaseUrls(_dio.options.baseUrl, baseUrl)),
     );
     final _result = await _dio.fetch<List<int>>(_options);
-    final _value = await compute(Result.fromBuffer, _result.data!);
+    final _value = Result.fromBuffer(_result.data!);
 ''', contains: true)
 @RestApi(parser: Parser.MapSerializable)
 abstract class ProtoSupportParserMapSerializable {
@@ -2769,7 +2907,7 @@ abstract class ProtoSupportParserMapSerializable {
           .copyWith(baseUrl: _combineBaseUrls(_dio.options.baseUrl, baseUrl)),
     );
     final _result = await _dio.fetch<List<int>>(_options);
-    final _value = await compute(Result.fromBuffer, _result.data!);
+    final _value = Result.fromBuffer(_result.data!);
 ''', contains: true)
 @RestApi(parser: Parser.FlutterCompute)
 abstract class ProtoSupportParserFlutterCompute {
@@ -2964,6 +3102,68 @@ abstract class PartMapWithFileAndStaticDefaultsTest {
   Future<String> uploadFile({
     @Part(name: 'file', fileName: 'default.txt', contentType: 'text/plain')
     required File file,
+    @PartMap() Map<String, dynamic>? partMeta,
+  });
+}
+
+@ShouldGenerate('''
+    if (file != null) {
+      final _file_fileName =
+          (partMetadata?['file_fileName'] as String?) ??
+          file.path.split(Platform.pathSeparator).last;
+      final DioMediaType? _file_contentType =
+          (partMetadata?['file_contentType'] as String?) != null
+          ? DioMediaType.parse(partMetadata!['file_contentType'] as String)
+          : null;
+      _data.files.add(
+        MapEntry(
+          'file',
+          MultipartFile.fromFileSync(
+            file.path,
+            filename: _file_fileName,
+            contentType: _file_contentType,
+          ),
+        ),
+      );
+    }
+''', contains: true)
+@RestApi(baseUrl: 'https://httpbin.org/')
+abstract class PartMapWithNullableFileTest {
+  @POST('/upload')
+  @MultiPart()
+  Future<String> uploadFile({
+    @Part(name: 'file') File? file,
+    @PartMap() Map<String, dynamic>? partMetadata,
+  });
+}
+
+@ShouldGenerate('''
+    if (file != null) {
+      final _file_fileName =
+          (partMeta?['file_fileName'] as String?) ?? 'default.txt';
+      final _file_contentType =
+          (partMeta?['file_contentType'] as String?) != null
+          ? DioMediaType.parse(partMeta!['file_contentType'] as String)
+          : DioMediaType.parse('text/plain');
+      _data.files.add(
+        MapEntry(
+          'file',
+          MultipartFile.fromFileSync(
+            file.path,
+            filename: _file_fileName,
+            contentType: _file_contentType,
+          ),
+        ),
+      );
+    }
+''', contains: true)
+@RestApi(baseUrl: 'https://httpbin.org/')
+abstract class PartMapWithNullableFileAndStaticDefaultsTest {
+  @POST('/upload')
+  @MultiPart()
+  Future<String> uploadFile({
+    @Part(name: 'file', fileName: 'default.txt', contentType: 'text/plain')
+    File? file,
     @PartMap() Map<String, dynamic>? partMeta,
   });
 }
@@ -3179,4 +3379,87 @@ abstract class TestBareTypeParameter {
 abstract class TestBareTypeParameterNullable {
   @GET('/test')
   Future<T?> getNullable<T>();
+}
+
+// Tests for ResponseType.stream with Stream<Uint8List> and Stream<String>
+
+@ShouldGenerate(
+  '''
+    final _result = _dio.fetch<ResponseBody>(_options);
+    final _value = _result.asStream().asyncExpand(
+      (response) => utf8.decoder.bind(response.data!.stream),
+    );
+    yield* _value;
+''',
+  contains: true,
+  expectedLogItems: [
+    'ResponseType  :  1',
+    '\x1B[33mMethod getServerEvents returns Stream<String> and uses utf8.decoder.bind. Ensure your API class file imports dart:convert: import \'dart:convert\';\x1B[0m',
+  ],
+)
+@RestApi()
+abstract class TestResponseTypeStreamString {
+  @GET('/events')
+  @DioResponseType(ResponseType.stream)
+  Stream<String> getServerEvents();
+}
+
+@ShouldThrow(
+  'When using @DioResponseType(ResponseType.stream), the return type must be Stream<Uint8List> or Stream<String>. Got: Future<String>',
+  element: false,
+  expectedLogItems: ['ResponseType  :  1'],
+)
+@RestApi()
+abstract class TestResponseTypeStreamInvalidReturnType {
+  @GET('/download')
+  @DioResponseType(ResponseType.stream)
+  Future<String> downloadFile();
+}
+
+@ShouldThrow(
+  'When using @DioResponseType(ResponseType.stream), the return type must be Stream<Uint8List> or Stream<String>. Got: Stream<int>',
+  element: false,
+  expectedLogItems: ['ResponseType  :  1'],
+)
+@RestApi()
+abstract class TestResponseTypeStreamInvalidReturnTypeStreamInt {
+  @GET('/download')
+  @DioResponseType(ResponseType.stream)
+  Stream<int> downloadFile();
+}
+
+// Freezed + json_serializable declare fromJson in source. toJson lives in the
+// generated mixin / private impl, which retrofit_generator may not see yet.
+class FreezedJsonModel {
+  const FreezedJsonModel();
+
+  // ignore: avoid_unused_constructor_parameters
+  factory FreezedJsonModel.fromJson(Map<String, dynamic> json) =>
+      const FreezedJsonModel();
+}
+
+@ShouldGenerate('''
+    final _data = <String, dynamic>{};
+    _data.addAll(model.toJson());
+''', contains: true)
+@RestApi(baseUrl: 'https://httpbin.org/')
+abstract class TestFreezedJsonModelBody {
+  @POST('/models')
+  Future<void> create(@Body() FreezedJsonModel model);
+}
+
+abstract class AbstractToJsonModel {
+  const AbstractToJsonModel();
+
+  Map<String, dynamic> toJson();
+}
+
+@ShouldGenerate('''
+    final _data = <String, dynamic>{};
+    _data.addAll(model.toJson());
+''', contains: true)
+@RestApi(baseUrl: 'https://httpbin.org/')
+abstract class TestAbstractToJsonModelBody {
+  @POST('/models')
+  Future<void> create(@Body() AbstractToJsonModel model);
 }
